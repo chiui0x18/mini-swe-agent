@@ -82,7 +82,14 @@ class LitellmModel:
         for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
             with attempt:
                 response = self._query(self._prepare_messages_for_api(messages), **kwargs)
-        cost_output = self._calculate_cost(response)
+
+        # FIXME hack to make free tier models e.g. openrouter/openrouter/free work
+        try:
+            cost_output = self._calculate_cost(response)
+        except Exception as e:
+            logger.exception('error calculating cost of querying LM service')
+            cost_output = { 'cost': 0.0 }
+
         GLOBAL_MODEL_STATS.add(cost_output["cost"])
         # Note: all model.query() implementations must persist the response and cost on FormatError.
         try:
