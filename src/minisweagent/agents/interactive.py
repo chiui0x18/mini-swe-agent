@@ -15,7 +15,7 @@ from rich.rule import Rule
 
 from minisweagent.agents.default import AgentConfig, DefaultAgent
 from minisweagent.agents.utils.prompt_user import _multiline_prompt, prompt_session
-from minisweagent.exceptions import LimitsExceeded, Submitted, TimeExceeded, UserInterruption
+from minisweagent.exceptions import FormatError, LimitsExceeded, Submitted, TimeExceeded, UserInterruption
 from minisweagent.models.utils.content_string import get_content_string
 
 console = Console(highlight=False)
@@ -36,6 +36,7 @@ class InteractiveAgent(DefaultAgent):
     def __init__(self, *args, config_class=InteractiveAgentConfig, **kwargs):
         super().__init__(*args, config_class=config_class, **kwargs)
         self.cost_last_confirmed = 0.0
+        self.n_calls_no_tool_use = 0
 
     def _interrupt(self, content: str, *, itype: str = "UserInterruption") -> NoReturn:
         raise UserInterruption({"role": "user", "content": content, "extra": {"interrupt_type": itype}})
@@ -46,19 +47,19 @@ class InteractiveAgent(DefaultAgent):
             role, content = msg.get("role") or msg.get("type", "unknown"), get_content_string(msg)
             if role == "assistant":
                 console.print(
-                    f"\n[red][bold]mini-swe-agent[/bold] (step [bold]{self.n_calls}[/bold], [bold]${self.cost:.2f}[/bold]):[/red]\n",
+                    f"\n[red][bold]Agent[/bold] (step [bold]{self.n_calls}[/bold], [bold]${self.cost:.2f}[/bold]):[/red]\n",
                     end="",
                     highlight=False,
                 )
             else:
-                console.print(f"\n[bold green]{role.capitalize()}[/bold green]:\n", end="", highlight=False)
+                console.print(f"\n[bold cyan]{role.capitalize()}:[/bold cyan]\n", end="", highlight=False)
             console.print(content, highlight=False, markup=False)
         return super().add_messages(*messages)
 
     def query(self) -> dict:
         # Extend supermethod to handle human mode
         if self.config.mode == "human":
-            match command := self._prompt_and_handle_slash_commands("[bold yellow]>[/bold yellow] "):
+            match command := self._prompt_and_handle_slash_commands("[bold green]$[/] "):
                 case "/y" | "/c":
                     pass
                 case _:
@@ -92,6 +93,8 @@ class InteractiveAgent(DefaultAgent):
             self.config.step_limit = int(input("New step limit: "))
             self.config.cost_limit = float(input("New cost limit: "))
             return super().query()
+        except FormatError as e:
+            return self._gen_message_without_tool_use(e)
 
     @staticmethod
     def _stdin_is_interactive() -> bool:
@@ -109,7 +112,7 @@ class InteractiveAgent(DefaultAgent):
     def step(self) -> list[dict]:
         # Override the step method to handle user interruption
         try:
-            console.print(Rule())
+            console.print(Rule(characters="-"))
             return super().step()
         except KeyboardInterrupt:
             interruption_message = self._prompt_and_handle_slash_commands(
@@ -124,6 +127,11 @@ class InteractiveAgent(DefaultAgent):
     def execute_actions(self, message: dict) -> list[dict]:
         # Override to handle user confirmation and confirm_exit, with try/finally to preserve partial outputs
         actions = message.get("extra", {}).get("actions", [])
+
+        # Handle LM service response that entails no tool use
+        if not actions:
+            return self.followup_to_assistant_message_without_tool_use(message)
+
         commands = [action["command"] for action in actions]
         outputs = []
         try:
@@ -167,7 +175,7 @@ class InteractiveAgent(DefaultAgent):
             return
         prompt = (
             f"[bold yellow]Execute {len(commands)} action(s)?[/] [green][bold]Enter[/] to confirm[/], "
-            "[red]type [bold]comment[/] to reject[/], or [blue][bold]/h[/] to show available commands[/]\n"
+            "[red]type [bold]comment[/] to reject[/], or [deep_sky_blue1][bold]/h[/] to show available commands[/]\n"
             "[bold yellow]>[/bold yellow] "
         )
         match user_input := self._prompt_and_handle_slash_commands(prompt).strip():
@@ -207,3 +215,82 @@ class InteractiveAgent(DefaultAgent):
             console.print(f"Switched to [bold green]{self.config.mode}[/bold green] mode.")
             return user_input
         return user_input
+
+    def _gen_message_without_tool_use(self, err: FormatError) -> dict:
+        """Check if given err indicates LM service response entails no tool use, if so craft dedicated agent-level message.
+
+        Catch FormatError here and check if err indicates no tool call in LM service response.
+        If not, re-raise it.
+        Otherwise craft a dedicated message for no tool use case.
+        Then handle it and subsequent user followup in execute_actions
+
+        Per existent codebase logic, a message contains following fields:
+        - role(str): user/assistant/system/exit etc
+        - content(seemingly unbound): Message content, see function get_content_string
+        - extra(dict): Miscellaneous details of message
+        """
+        lg = self.logger
+        if not self._stdin_is_interactive():
+            lg.warn("Running agent in a non-interactive environment. Forcing agent to act")
+            raise err
+
+        message_from_err = err.messages[0]
+        if not re.search(r"No tool calls found in the response", message_from_err.get("content", ""), flags=re.M):
+            raise err
+
+        lm_rsp = message_from_err["extra"]["response"]
+        # Try getting the content which seems LM service specific.
+        # If failed, simply serialize the whole response as content.
+        try:
+            content = lm_rsp["choices"][0]["message"]["content"]
+        except ValueError, IndexError:
+            lg.warn(
+                "Path to expected message blob `.choices[0].message` "
+                "seems absent in LM service response. Serialize whole response as message content"
+            )
+            content = repr(lm_rsp)
+
+        return {
+            "role": "assistant",
+            "content": content,
+            "extra": message_from_err["extra"], # preserve from original message for update of cost stat etc
+        }
+
+    def followup_to_assistant_message_without_tool_use(self, msg: dict) -> list[dict]:
+        """
+        Spec:
+        Update running stats below:
+        - Cost
+        - No. LM responses that entails no tool use
+        Pretty print assistant message to console.
+        Let human user decide next step:
+        - Respond
+        - Exit session
+        - See available step options
+        Implement each step option.
+        Return updated message list for this session.
+        """
+        self.cost += msg.get("extra", {}).get("cost", 0.0)
+        self.n_calls_no_tool_use += 1
+        self.add_messages(msg)
+
+        prompt = (
+            f"[yellow]No tool use in agent response ([bold]count: {self.n_calls_no_tool_use}[/])[/]\n"
+            "[bold green]/m[/] to type followup feedback in multiline\n"
+            "[bold green]/q[/] to end current session\n"
+            "[bold green]/h[/] to show available commands\n"
+        )
+        match user_input := self._prompt_and_handle_slash_commands(prompt).strip():
+            case "/q":
+                # Signal exit and reuse existent exit path logic
+                followup_msg = {
+                    "role": "exit",
+                    "content": "User proactively ends session",
+                }
+            case _:
+                followup_msg = {
+                    "role": "user",
+                    "content": user_input,
+                }
+
+        return self.add_messages(followup_msg)
