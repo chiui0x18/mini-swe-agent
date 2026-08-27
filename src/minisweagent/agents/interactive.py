@@ -253,7 +253,7 @@ class InteractiveAgent(DefaultAgent):
         return {
             "role": "assistant",
             "content": content,
-            "extra": message_from_err["extra"], # preserve from original message for update of cost stat etc
+            "extra": message_from_err["extra"],  # preserve from original message for update of cost stat etc
         }
 
     def followup_to_assistant_message_without_tool_use(self, msg: dict) -> list[dict]:
@@ -264,33 +264,50 @@ class InteractiveAgent(DefaultAgent):
         - No. LM responses that entails no tool use
         Pretty print assistant message to console.
         Let human user decide next step:
-        - Respond
+        - Provide written feedback and continue current conversation
         - Exit session
-        - See available step options
-        Implement each step option.
+        - Iteratively experiment based on user's thought and LM service response by running shell commands
         Return updated message list for this session.
         """
         self.cost += msg.get("extra", {}).get("cost", 0.0)
         self.n_calls_no_tool_use += 1
         self.add_messages(msg)
 
+        console.print(f"[yellow]No tool use in agent response ([bold]count: {self.n_calls_no_tool_use}[/])[/]")
         prompt = (
-            f"[yellow]No tool use in agent response ([bold]count: {self.n_calls_no_tool_use}[/])[/]\n"
-            "[bold green]/m[/] to type followup feedback in multiline\n"
+            "Type to give feedback. Enter for newline\n"
+            "[bold green]!cmd[/] to run `cmd` in sub shell. For testing only\n"
             "[bold green]/q[/] to end current session\n"
-            "[bold green]/h[/] to show available commands\n"
         )
-        match user_input := self._prompt_and_handle_slash_commands(prompt).strip():
-            case "/q":
-                # Signal exit and reuse existent exit path logic
-                followup_msg = {
-                    "role": "exit",
-                    "content": "User proactively ends session",
-                }
-            case _:
-                followup_msg = {
-                    "role": "user",
-                    "content": user_input,
-                }
+        while True:
+            match user_input := self._prompt_and_handle_slash_commands(prompt, _multiline=True).strip():
+                case "/q":
+                    # Signal exit and reuse existent exit path logic
+                    followup_msg = {
+                        "role": "exit",
+                        "content": "User proactively ends session",
+                    }
+                    break
+                case str(_) if m := re.match(r"^!(..*)", user_input, re.DOTALL):
+                    # TODO execute user-issue shell commands in a subshell, pretty print output then prompt user again
+                    user_shell_cmd = m.group(1)
+                    action = {"command": user_shell_cmd}
+                    output = self.env.execute(action)
+                    console.print(Rule(title="Test command output", characters="+", style="magenta3"))
+                    console.print(
+                        f"Return code: {output['returncode']}\n"
+                        f"Output:\n{output['output']}\n"
+                        f"Exception:\n{output['exception_info']}",
+                        highlight=False,
+                        markup=False,
+                    )
+                    console.print(Rule(characters="+", style="magenta3"))
+
+                case _:
+                    followup_msg = {
+                        "role": "user",
+                        "content": user_input,
+                    }
+                    break
 
         return self.add_messages(followup_msg)
